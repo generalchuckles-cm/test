@@ -1,63 +1,61 @@
 # nsb8: An Intel 8008 Emulator in Python for NotSoBot
-# Part 1: The Foundation and First 10 Instructions
+# Part 2: Robust assembler and 20 total instructions
 
 import sys
 
-# NotSoBot passes arguments in a list called 'args'
-# We'll default to a test string if 'args' isn't available for local testing
 try:
     assembly_code = args[1]
 except (NameError, IndexError):
-    assembly_code = "LAI 10 HLT" # Default for testing outside the bot
+    assembly_code = "LHI 14 LLI 238 LAI 65 LMA HLT" # Default test: Write 'A' to screen
 
 # ===================================================================
-# | Simple 8008 Assembler                                           |
+# | Robust 8008 Assembler                                           |
 # ===================================================================
 def assemble(code):
-    """Converts 8008 assembly mnemonics into bytecode."""
+    """Converts 8008 assembly mnemonics into bytecode. Now with better parsing."""
     bytecode = []
     status = "Assembled successfully. "
     
     opcodes = {
         # Mnemonic: (Opcode, Number of Operands)
+        # First 10
         "HLT": (0x01, 0), "LAI": (0x06, 1), "LBI": (0x0E, 1), "LCI": (0x16, 1),
+        "LDI": (0x26, 1), "LEI": (0x2E, 1), "LHI": (0x36, 1), "LLI": (0x3E, 1),
         "LAB": (0xC1, 0), "LBA": (0x87, 0), "ADB": (0x80, 0), "LAM": (0xC6, 0),
-        "LMA": (0x77, 0), "JMP": (0x44, 2)
+        "LMA": (0x77, 0), "JMP": (0x44, 2),
+        # Next 10
+        "INB": (0x0C, 0), "DCB": (0x0D, 0), "SUI": (0x96, 1),
+        "JFC": (0x40, 2), "JTC": (0x48, 2), "CAL": (0x46, 2)
+        # Note: We will add RET (return) in the next batch!
     }
 
-    # Normalize input: handle multiple instructions on one line
-    clean_code = code.replace('\n', ' ').upper()
-    tokens = [token for token in clean_code.split(' ') if token] # Split and remove empty strings
+    # Better tokenizing: handles any whitespace and removes comments first
+    clean_code = code.split(';')[0].upper()
+    tokens = clean_code.split()
 
     i = 0
     while i < len(tokens):
         mnemonic = tokens[i]
+        i += 1
+        
         if mnemonic in opcodes:
             opcode, num_operands = opcodes[mnemonic]
             bytecode.append(opcode)
             
-            if i + num_operands >= len(tokens):
-                return None, f"Error: Mnemonic '{mnemonic}' requires {num_operands} operand(s), but not enough were provided."
+            if i + num_operands > len(tokens):
+                return None, f"Error: Mnemonic '{mnemonic}' needs {num_operands} operand(s)."
 
-            # Handle operands
+            operands = tokens[i : i + num_operands]
+            i += num_operands
+
             if num_operands == 1:
-                operand = int(tokens[i+1])
-                bytecode.append(operand)
-                i += 1
-            elif num_operands == 2: # For JMP addr
-                addr = int(tokens[i+1])
-                low_byte = addr & 0xFF
-                high_byte = (addr >> 8) & 0xFF
-                bytecode.append(low_byte)
-                bytecode.append(high_byte)
-                i += 1
-        
+                bytecode.append(int(operands[0]))
+            elif num_operands == 2: # For JMP, JFC, JTC, CAL
+                addr = int(operands[0])
+                bytecode.append(addr & 0xFF)         # Low byte
+                bytecode.append((addr >> 8) & 0xFF)  # High byte
         else:
-            # Handle comments, which might be passed as tokens
-            if mnemonic.startswith(';'):
-                break # Stop processing at comment
             return None, f"Error: Unknown mnemonic '{mnemonic}'"
-        i += 1
 
     status += f"Program size: {len(bytecode)} bytes."
     return bytecode, status
@@ -67,134 +65,97 @@ def assemble(code):
 # ===================================================================
 class Intel8008:
     def __init__(self):
-        # Memory: 16KB, initialized to zeros
         self.memory = bytearray(16384)
-        
-        # Registers: A, B, C, D, E, H, L
-        self.regs = {'A': 0, 'B': 0, 'C': 0, 'D': 0, 'E': 0, 'H': 0, 'L': 0}
-        
-        # Flags: Carry, Zero, Sign, Parity
-        self.flags = {'C': 0, 'Z': 1, 'S': 0, 'P': 1}
-        
-        # Program Counter (14-bit) and Halted state
+        self.regs = {'A':0,'B':0,'C':0,'D':0,'E':0,'H':0,'L':0}
+        self.flags = {'C':0,'Z':1,'S':0,'P':1}
         self.pc = 0
+        self.sp = 0 # Stack pointer for our 7-level stack
+        self.stack = [0] * 7
         self.halted = False
 
-    def load_program(self, bytecode):
-        """Copies the assembled program into the CPU's memory."""
-        self.memory[0:len(bytecode)] = bytecode
-
-    def get_hl(self):
-        """Returns the 14-bit memory address from registers H and L."""
-        # H is the high 6 bits, L is the low 8 bits
-        return ((self.regs['H'] & 0x3F) << 8) | self.regs['L']
+    def load_program(self, bytecode): self.memory[0:len(bytecode)] = bytecode
+    def get_hl(self): return ((self.regs['H'] & 0x3F) << 8) | self.regs['L']
+    def read_mem(self, addr): return self.memory[addr & 0x3FFF]
+    def write_mem(self, addr, val): self.memory[addr & 0x3FFF] = val & 0xFF
 
     def update_flags(self, val):
-        """Updates Z, S, and P flags based on a result value."""
-        val &= 0xFF # Ensure value is 8-bit
+        val &= 0xFF
         self.flags['Z'] = 1 if val == 0 else 0
         self.flags['S'] = 1 if (val & 0x80) else 0
-        
-        # Parity check (count set bits)
-        parity = 0
-        for i in range(8):
-            if (val >> i) & 1:
-                parity += 1
-        self.flags['P'] = 1 if parity % 2 == 0 else 0
+        self.flags['P'] = 1 if bin(val).count('1') % 2 == 0 else 0
         
     def execute(self):
-        """The main fetch-decode-execute loop."""
-        max_cycles = 200000
-        for _ in range(max_cycles):
-            if self.halted:
-                break
+        for _ in range(250000):
+            if self.halted: break
             
-            opcode = self.memory[self.pc]
+            opcode = self.read_mem(self.pc)
             self.pc += 1
 
             # --- INSTRUCTION DECODING ---
-            if opcode == 0x01: # HLT
-                self.halted = True
-            
-            elif opcode == 0x06: # LAI data
-                self.regs['A'] = self.memory[self.pc]
-                self.pc += 1
-            
-            elif opcode == 0x0E: # LBI data
-                self.regs['B'] = self.memory[self.pc]
-                self.pc += 1
-                
-            elif opcode == 0x16: # LCI data
-                self.regs['C'] = self.memory[self.pc]
-                self.pc += 1
-
-            elif opcode == 0xC1: # LAB
-                self.regs['A'] = self.regs['B']
-            
-            elif opcode == 0x87: # LBA
-                self.regs['B'] = self.regs['A']
-                
+            if   opcode == 0x01: self.halted = True
+            elif opcode == 0x06: self.regs['A'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0x0E: self.regs['B'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0x16: self.regs['C'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0x26: self.regs['D'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0x2E: self.regs['E'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0x36: self.regs['H'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0x3E: self.regs['L'] = self.read_mem(self.pc); self.pc += 1
+            elif opcode == 0xC1: self.regs['A'] = self.regs['B']
+            elif opcode == 0x87: self.regs['B'] = self.regs['A']
             elif opcode == 0x80: # ADB
-                result = self.regs['A'] + self.regs['B']
-                self.flags['C'] = 1 if result > 255 else 0
-                self.regs['A'] = result & 0xFF
-                self.update_flags(self.regs['A'])
-                
-            elif opcode == 0xC6: # LAM
-                addr = self.get_hl()
-                self.regs['A'] = self.memory[addr]
-            
-            elif opcode == 0x77: # LMA
-                addr = self.get_hl()
-                self.memory[addr] = self.regs['A']
-                
-            elif opcode == 0x44: # JMP addr
-                low_byte = self.memory[self.pc]
-                high_byte = self.memory[self.pc + 1]
-                self.pc = (high_byte << 8) | low_byte
-        
-        else: # This 'else' belongs to the 'for' loop
-            return "Warning: Execution hit max cycle limit."
+                res = self.regs['A'] + self.regs['B']
+                self.flags['C'] = 1 if res > 255 else 0
+                self.regs['A'] = res & 0xFF; self.update_flags(self.regs['A'])
+            elif opcode == 0xC6: self.regs['A'] = self.read_mem(self.get_hl())
+            elif opcode == 0x77: self.write_mem(self.get_hl(), self.regs['A'])
+            elif opcode in [0x44, 0x40, 0x48, 0x46]: # JMP, JFC, JTC, CAL
+                low = self.read_mem(self.pc)
+                high = self.read_mem(self.pc + 1)
+                addr = (high << 8) | low
+                do_jump = False
+                if opcode == 0x44: do_jump = True                           # JMP
+                if opcode == 0x40 and self.flags['C'] == 0: do_jump = True # JFC
+                if opcode == 0x48 and self.flags['C'] == 1: do_jump = True # JTC
+                if opcode == 0x46: # CAL
+                    self.stack[self.sp] = self.pc + 2 # Store return address
+                    self.sp = (self.sp + 1) % 7       # Increment stack pointer
+                    do_jump = True
+                if do_jump: self.pc = addr
+                else: self.pc += 2
+            elif opcode == 0x0C: # INB
+                self.regs['B'] = (self.regs['B'] + 1) & 0xFF
+                self.update_flags(self.regs['B'])
+            elif opcode == 0x0D: # DCB
+                self.regs['B'] = (self.regs['B'] - 1) & 0xFF
+                self.update_flags(self.regs['B'])
+            elif opcode == 0x96: # SUI
+                data = self.read_mem(self.pc); self.pc += 1
+                res = self.regs['A'] - data
+                self.flags['C'] = 1 if res < 0 else 0
+                self.regs['A'] = res & 0xFF; self.update_flags(self.regs['A'])
+        else: return "Warning: Execution hit max cycle limit."
         return "Execution halted normally."
 
     def get_screen_output(self):
-        """Reads the 'screen' memory region and returns it as a string."""
-        screen_mem = self.memory[0xEEE : 0xFFF + 1]
         output = ""
-        for char_code in screen_mem:
-            if 32 <= char_code < 127:
-                output += chr(char_code)
-            else:
-                output += "·"
+        for char_code in self.memory[0xEEE : 0xFFF + 1]:
+            output += chr(char_code) if 32 <= char_code < 127 else "·"
         return output
 
 # ===================================================================
 # | Main Execution Logic                                            |
 # ===================================================================
 bytecode, status = assemble(assembly_code)
-
-if not bytecode:
-    # If assembly failed, status contains the error message
-    final_output = status
+if not bytecode: final_output = status
 else:
-    # 1. Create a CPU instance
-    cpu = Intel8008()
-    # 2. Load the program
+    cpu, halt_status = Intel8008(), "Execution error."
     cpu.load_program(bytecode)
-    # 3. Execute the program
     halt_status = cpu.execute()
-    
-    # 4. Format and print the final state
-    screen = cpu.get_screen_output()
-    regs = cpu.regs
-    flags = cpu.flags
+    regs, flags = cpu.regs, cpu.flags
     czsp = f"{flags['C']}{flags['Z']}{flags['S']}{flags['P']}"
-    
     final_output = (
         f"{status}\n{halt_status}\n---\n"
-        f"Screen (0xEEE - 0xFFF):\n{screen}\n---\n"
-        f"Final A:{regs['A']} B:{regs['B']} C:{regs['C']} | Flags(CZSP):{czsp}"
+        f"Screen (0xEEE - 0xFFF):\n{cpu.get_screen_output()}\n---\n"
+        f"Final A:{regs['A']} B:{regs['B']} C:{regs['C']} D:{regs['D']} E:{regs['E']} H:{regs['H']} L:{regs['L']} | Flags(CZSP):{czsp}"
     )
-
-# The 'print' function sends the output back to the bot
 print(final_output)
